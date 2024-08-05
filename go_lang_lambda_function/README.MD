@@ -7,3 +7,9 @@
 - 5. Create a .zip Package :- `zip deployment.zip bootstrap`
 - 6. Now upload this Zip file for code your Lambda
 
+- In this we insert URL with SQS message 
+    - example 
+    - `{
+            "url": "< url >",
+            "message_body": "This is a simple text message."
+        }`

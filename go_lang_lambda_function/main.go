@@ -2,10 +2,9 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/md5"
-	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -13,81 +12,132 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 )
 
-var processedMessageIDs = map[string]struct{}{}
+// Initialize an empty map to keep track of processed message IDs
+var processedMessageIDs = make(map[string]struct{})
 
-func handler(ctx context.Context, event json.RawMessage) (map[string]interface{}, error) {
-	log.Printf("Event: %s", string(event))
+// Record represents an SQS record
+type Record struct {
+	MessageID         string                 `json:"messageId"`
+	ReceiptHandle     string                 `json:"receiptHandle"`
+	Body              string                 `json:"body"`
+	Attributes        map[string]interface{} `json:"attributes"`
+	MessageAttributes map[string]interface{} `json:"messageAttributes"`
+	Md5OfBody         string                 `json:"md5OfBody"`
+	EventSource       string                 `json:"eventSource"`
+	EventSourceARN    string                 `json:"eventSourceARN"`
+	AwsRegion         string                 `json:"awsRegion"`
+}
 
-	// Decode the JSON event into a slice of SQS messages
-	var records []map[string]interface{}
-	if err := json.Unmarshal(event, &records); err != nil {
+// Event represents the SQS event structure
+type Event struct {
+	Records []Record `json:"Records"`
+}
+
+// Lambda function handler
+func handler(event interface{}) (map[string]interface{}, error) {
+	var records []Record
+
+	// Determine the type of event and unmarshal accordingly
+	switch e := event.(type) {
+	case []interface{}:
+		// If the event is an array, iterate over each element
+		for _, r := range e {
+			recordBytes, _ := json.Marshal(r)
+			var record Record
+			if err := json.Unmarshal(recordBytes, &record); err != nil {
+				log.Printf("JSON Decode Error: %v", err)
+				continue
+			}
+			records = append(records, record)
+		}
+	case map[string]interface{}:
+		// If the event is a map with "Records" field, unmarshal into Event
+		eventBytes, _ := json.Marshal(e)
+		var evt Event
+		if err := json.Unmarshal(eventBytes, &evt); err != nil {
+			log.Printf("JSON Decode Error: %v", err)
+			return nil, err
+		}
+		records = evt.Records
+	default:
+		// Return an error if the event format is invalid
 		return map[string]interface{}{
 			"statusCode": 400,
-			"body":       "Bad Request: Error parsing event",
+			"body":       "Bad Request: Invalid event format",
 		}, nil
 	}
 
 	// Process each record
 	for _, record := range records {
-		body, ok := record["body"]
-		if !ok {
-			log.Printf("Missing 'body' in record: %v", record)
+		body := record.Body
+
+		// Parse the body content to extract the URL and other data
+		var bodyContent map[string]interface{}
+		if err := json.Unmarshal([]byte(body), &bodyContent); err != nil {
+			log.Printf("JSON Decode Error: %v", err)
 			continue
 		}
+
+		// Extract the URL from the body content
+		URL, ok := bodyContent["url"].(string)
+		if !ok {
+			log.Printf("Missing 'url' in message body: %v", bodyContent)
+			continue
+		}
+		delete(bodyContent, "url")
 
 		// Create a unique hash for the message body to use as a deduplication key
-		bodyStr, ok := body.(string)
-		if !ok {
-			log.Printf("Invalid 'body' type in record: %v", record)
-			continue
-		}
+		messageHash := md5.Sum([]byte(fmt.Sprintf("%v", record)))
+		hashString := fmt.Sprintf("%x", messageHash)
 
-		messageHash := md5Hash(bodyStr)
-
-		if _, found := processedMessageIDs[messageHash]; found {
+		// Check if the message has already been processed
+		if _, exists := processedMessageIDs[hashString]; exists {
 			log.Printf("Duplicate message detected: %v", record)
 			continue
 		}
 
-		processedMessageIDs[messageHash] = struct{}{}
+		// Add the message hash to the set of processed messages
+		processedMessageIDs[hashString] = struct{}{}
 
-		// Forward the entire SQS message to the external API
-		resp, err := forwardToAPI(record)
+		// Convert the updated bodyContent back to a JSON string
+		updatedBody, err := json.Marshal(bodyContent)
 		if err != nil {
-			log.Printf("Request Exception: %s", err)
+			log.Printf("JSON Marshal Error: %v", err)
 			continue
 		}
 
+		// Update the body of the record
+		record.Body = string(updatedBody)
+
+		// Marshal the record to JSON
+		messageBytes, err := json.Marshal(record)
+		if err != nil {
+			log.Printf("JSON Marshal Error: %v", err)
+			continue
+		}
+
+		// Send the updated record to the specified URL
+		resp, err := http.Post(URL, "application/json", bytes.NewBuffer(messageBytes))
+		if err != nil {
+			log.Printf("Request Exception: %v", err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		// Read and log the response
+		respBody, _ := io.ReadAll(resp.Body)
 		log.Printf("Status Code: %d", resp.StatusCode)
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		log.Printf("Response Body: %s", string(bodyBytes))
+		log.Printf("Response Body: %s", respBody)
 	}
 
+	// Return success response
 	return map[string]interface{}{
 		"statusCode": 200,
 		"body":       "Request forwarded successfully",
 	}, nil
 }
 
-func md5Hash(text string) string {
-	hash := md5.Sum([]byte(text))
-	return hex.EncodeToString(hash[:])
-}
-
-func forwardToAPI(body interface{}) (*http.Response, error) {
-	apiURL := "https://webhook.site/f7274881-d5c1-43f3-9a30-de0a0a255cdd"
-	bodyBytes, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(bodyBytes))
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
 func main() {
+	// Start the Lambda function
 	lambda.Start(handler)
 }
